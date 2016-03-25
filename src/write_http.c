@@ -37,9 +37,8 @@
 
 #include <curl/curl.h>
 
-#ifndef WRITE_HTTP_DEFAULT_BUFFER_SIZE
-# define WRITE_HTTP_DEFAULT_BUFFER_SIZE 4096
-#endif
+#define WH_HTTP_DEFAULT_BUFFER_SIZE 4096
+#define WH_HTTP_MIN_BUFFER_SIZE     1024
 
 #define WH_FORMAT_COMMAND 0
 #define WH_FORMAT_JSON    1
@@ -54,7 +53,7 @@
 static pthread_key_t   wh_ctx_key;
 
 /*
- * Write thread specific context
+ * I/O thread specific context
  */
 struct wh_ctx_s
 {
@@ -65,12 +64,13 @@ struct wh_ctx_s
         char  *send_buffer;
         size_t send_buffer_free;
         size_t send_buffer_fill;
+        size_t send_buffer_size;
         cdtime_t send_buffer_init_time;
 };
 typedef struct wh_ctx_s wh_ctx_t;
 
 /*
- * Private variables
+ * Global Config
  */
 struct wh_cfg_s
 {
@@ -102,26 +102,30 @@ static int wh_ctx_init (wh_ctx_t *ctx);
 /* Global config */
 wh_cfg_t *wh_cfg;
 
-static void wh_ctx_destructor (void *data)
+static void wh_ctx_destructor (void *data) /* {{{ */
 {
         wh_ctx_t *ctx = data;
-        if (ctx != NULL) {
-                if (ctx->headers != NULL) {
-                        curl_slist_free_all (ctx->headers);
-                        ctx->headers = NULL;
-                }
-                if (ctx->curl != NULL) {
-                        curl_easy_cleanup (ctx->curl);
-                        ctx->curl = NULL;
-                }
+        if (ctx == NULL)
+            return;
 
-                sfree (ctx->send_buffer);
-                ctx->send_buffer = NULL;
+        if (ctx->headers != NULL) {
+                curl_slist_free_all (ctx->headers);
+                ctx->headers = NULL;
         }
-        sfree (data);
-}
 
-static wh_ctx_t *wh_get_ctx()
+        if (ctx->curl != NULL) {
+                curl_easy_cleanup (ctx->curl);
+                ctx->curl = NULL;
+        }
+
+        sfree (ctx->send_buffer);
+        ctx->send_buffer = NULL;
+
+        sfree (data);
+
+} /* }}} void wh_ctx_destructor */
+
+static wh_ctx_t *wh_get_ctx(void) /* {{{ */
 {
         if (wh_cfg == NULL)
                 return NULL;
@@ -136,7 +140,6 @@ static wh_ctx_t *wh_get_ctx()
                 goto fail;
         }
 
-        memset(ctx, 0, sizeof(*ctx));
         if (wh_ctx_init(ctx)) {
             ERROR ("wh_get_ctx: failed to init wh context");
             goto fail;
@@ -148,9 +151,9 @@ static wh_ctx_t *wh_get_ctx()
 fail:
         wh_ctx_destructor(ctx);
         return NULL;
-}
+} /* }}} wh_ctx_t *wh_get_ctx */
 
-static void wh_log_http_error (wh_ctx_t *ctx)
+static void wh_log_http_error (wh_ctx_t *ctx) /* {{{ */
 {
         if (!wh_cfg->log_http_error)
                 return;
@@ -161,24 +164,45 @@ static void wh_log_http_error (wh_ctx_t *ctx)
 
         if (http_code != 200)
                 INFO ("write_http plugin: HTTP Error code: %lu", http_code);
-}
+} /* }}} void wh_log_http_error */
+
+static void wh_fill_buffer (wh_ctx_t *ctx, char *cmd, size_t cmd_len) /* {{{ */
+{
+        assert(wh_cfg != NULL);
+        assert(ctx != NULL);
+        assert(ctx->send_buffer_free >= cmd_len);
+
+        memcpy (ctx->send_buffer + ctx->send_buffer_fill, cmd, cmd_len);
+        ctx->send_buffer_fill += cmd_len;
+        ctx->send_buffer_free -= cmd_len;
+
+        /* TODO: cdtime uses REALTIME clock, which is not really
+         * what we want here (should be CLOCK_MONOTONIC instead)
+         */
+        if (ctx->send_buffer_init_time == 0)
+                ctx->send_buffer_init_time = cdtime ();
+
+} /* }}} void wh_fill_buffer */
 
 static void wh_reset_buffer (wh_ctx_t *ctx)  /* {{{ */
 {
-        memset (ctx->send_buffer, 0, wh_cfg->send_buffer_size);
-        ctx->send_buffer_free = wh_cfg->send_buffer_size;
+        memset (ctx->send_buffer, 0, ctx->send_buffer_size);
+        ctx->send_buffer_free = ctx->send_buffer_size;
         ctx->send_buffer_fill = 0;
-        ctx->send_buffer_init_time = cdtime ();
+        ctx->send_buffer_init_time = 0;
 
         if (wh_cfg->format == WH_FORMAT_JSON) {
                 format_json_initialize (ctx->send_buffer,
                                 &ctx->send_buffer_fill,
                                 &ctx->send_buffer_free);
         }
-} /* }}} wh_reset_buffer */
+} /* }}} void wh_reset_buffer */
 
 static int wh_send_buffer (wh_ctx_t *ctx) /* {{{ */
 {
+        assert(wh_cfg != NULL);
+        assert(ctx != NULL);
+
         int status = 0;
 
         CURL_SET_OPT(status, ctx, CURLOPT_POSTFIELDS, ctx->send_buffer);
@@ -195,19 +219,19 @@ static int wh_send_buffer (wh_ctx_t *ctx) /* {{{ */
                                 "status %i: %s",
                                 status, ctx->curl_errbuf);
         }
-        return (status);
-} /* }}} wh_send_buffer */
+
+        return status;
+} /* }}} int wh_send_buffer */
 
 static int wh_ctx_init (wh_ctx_t *ctx) /* {{{ */
 {
+        assert(wh_cfg != NULL);
+        assert(ctx != NULL);
+
         int res = 0;
         struct curl_slist *tmp = NULL;
 
-        if (wh_cfg == NULL)
-                return -1;
-
-        if (ctx->curl != NULL)
-                return -1;
+        memset(ctx, 0, sizeof(*ctx));
 
         ctx->curl = curl_easy_init ();
         if (ctx->curl == NULL) {
@@ -215,11 +239,14 @@ static int wh_ctx_init (wh_ctx_t *ctx) /* {{{ */
                 return -1;
         }
 
+        ctx->send_buffer_size = wh_cfg->send_buffer_size;
         ctx->send_buffer = malloc (wh_cfg->send_buffer_size);
         if (ctx->send_buffer == NULL) {
                 ERROR ("wh_get_ctx: malloc(%zu) failed.", wh_cfg->send_buffer_size);
                 return -1;
         }
+
+        wh_reset_buffer (ctx);
 
         tmp = curl_slist_append (ctx->headers, "Accept:  */*");
         if (tmp == NULL) {
@@ -286,54 +313,40 @@ static int wh_ctx_init (wh_ctx_t *ctx) /* {{{ */
         if (wh_cfg->capath != NULL)
                 CURL_SET_OPT (res, ctx, CURLOPT_CAPATH, wh_cfg->capath);
 
-        if (wh_cfg->clientkey != NULL && wh_cfg->clientcert != NULL)
-        {
-            CURL_SET_OPT (res, ctx, CURLOPT_SSLKEY, wh_cfg->clientkey);
-            CURL_SET_OPT (res, ctx, CURLOPT_SSLCERT, wh_cfg->clientcert);
+        if (wh_cfg->clientkey != NULL && wh_cfg->clientcert != NULL) {
+                CURL_SET_OPT (res, ctx, CURLOPT_SSLKEY, wh_cfg->clientkey);
+                CURL_SET_OPT (res, ctx, CURLOPT_SSLCERT, wh_cfg->clientcert);
 
-            if (wh_cfg->clientkeypass != NULL)
-                CURL_SET_OPT (res, ctx, CURLOPT_SSLKEYPASSWD, wh_cfg->clientkeypass);
+                if (wh_cfg->clientkeypass != NULL)
+                        CURL_SET_OPT (res, ctx, CURLOPT_SSLKEYPASSWD, wh_cfg->clientkeypass);
         }
 
-        wh_reset_buffer (ctx);
-        return (0);
-} /* }}} int wh_callback_init */
+        return res;
+} /* }}} int wh_ctx_init */
 
 static int wh_flush_nolock (cdtime_t timeout, wh_ctx_t *ctx) /* {{{ */
 {
-        int status;
-        /* Nulls the buffer and sets ..._free and ..._fill. */
-        wh_reset_buffer (ctx);
+        assert(wh_cfg != NULL);
+        assert(ctx != NULL);
+
+        int status = 0;
 
         DEBUG ("write_http plugin: wh_flush_nolock: timeout = %.3f; "
-                        "send_buffer_fill = %zu;",
-                        CDTIME_T_TO_DOUBLE (timeout),
-                        ctx->send_buffer_fill);
+                "send_buffer_fill = %zu;",
+                CDTIME_T_TO_DOUBLE (timeout),
+                ctx->send_buffer_fill);
 
-        /* timeout == 0  => flush unconditionally */
+        if (ctx->send_buffer_init_time == 0)
+                return 0;
+
+        /* timeout <= 0 flush unconditionally */
         if (timeout > 0) {
-                cdtime_t now;
-
-                now = cdtime ();
+                cdtime_t now = cdtime ();
                 if ((ctx->send_buffer_init_time + timeout) > now)
-                        return (0);
+                        return 0;
         }
 
-        if (wh_cfg->format == WH_FORMAT_COMMAND) {
-                if (ctx->send_buffer_fill <= 0) {
-                        ctx->send_buffer_init_time = cdtime ();
-                        return (0);
-                }
-
-                status = wh_send_buffer (ctx);
-                wh_reset_buffer (ctx);
-        }
-        else if (wh_cfg->format == WH_FORMAT_JSON) {
-
-                if (ctx->send_buffer_fill <= 2) {
-                        ctx->send_buffer_init_time = cdtime ();
-                        return (0);
-                }
+        if (wh_cfg->format == WH_FORMAT_JSON) {
 
                 status = format_json_finalize (ctx->send_buffer,
                                 &ctx->send_buffer_fill,
@@ -341,40 +354,27 @@ static int wh_flush_nolock (cdtime_t timeout, wh_ctx_t *ctx) /* {{{ */
                 if (status != 0) {
                         ERROR ("write_http: wh_flush_nolock: "
                                         "format_json_finalize failed.");
-                        goto fail;
+                        goto done;
                 }
-
-                status = wh_send_buffer (ctx);
-                wh_reset_buffer (ctx);
-        }
-        else {
-                ERROR ("write_http: wh_flush_nolock: "
-                                "Unknown format: %i",
-                                wh_cfg->format);
-                return (-1);
         }
 
-        return (status);
-
-fail:
+        status = wh_send_buffer (ctx);
+done:
         wh_reset_buffer (ctx);
-        return (status);
-} /* }}} wh_flush_nolock */
+        return status;
+} /* }}} int wh_flush_nolock */
 
 static int wh_flush (cdtime_t timeout, /* {{{ */
                 const char *identifier __attribute__((unused)),
                 user_data_t *unused __attribute__((unused)))
 {
         wh_ctx_t *ctx = wh_get_ctx();
-        int status;
+        if (ctx != NULL)
+                return wh_flush_nolock (timeout, ctx);
 
-        if (ctx == NULL) {
-                ERROR ("write_http plugin: cannot get ctx");
-                return (-EINVAL);
-        }
+        ERROR ("write_http plugin: cannot get ctx");
+        return (-EINVAL);
 
-        status = wh_flush_nolock (timeout, ctx);
-        return (status);
 } /* }}} int wh_flush */
 
 static void wh_config_free () /* {{{ */
@@ -401,25 +401,32 @@ static void wh_config_free () /* {{{ */
 static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{{ */
         wh_ctx_t *ctx)
 {
+        assert(wh_cfg != NULL);
+        assert(ctx != NULL);
+
         char key[10*DATA_MAX_NAME_LEN];
         char values[512];
         char command[1024];
-        size_t command_len;
+        size_t command_len = 0;
+        int status = 0;
 
-        int status;
+        /* WARNING: Excessive/nested data copying below: key, values, command,
+         * I/O buffer, etc.
+         */
 
         if (0 != strcmp (ds->type, vl->type)) {
                 ERROR ("write_http plugin: DS type does not match "
                                 "value list type");
-                return -1;
+                goto fail;
         }
 
         /* Copy the identifier to `key' and escape it. */
         status = FORMAT_VL (key, sizeof (key), vl);
         if (status != 0) {
                 ERROR ("write_http plugin: error with format_name");
-                return (status);
+                goto fail;
         }
+
         escape_string (key, sizeof (key));
 
         /* Convert the values to an ASCII representation and put that into
@@ -428,7 +435,7 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
         if (status != 0) {
                 ERROR ("write_http plugin: error with "
                                 "wh_value_list_to_string");
-                return (status);
+                goto fail;
         }
 
         command_len = (size_t) ssnprintf (command, sizeof (command),
@@ -439,32 +446,31 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
         if (command_len >= sizeof (command)) {
                 ERROR ("write_http plugin: Command buffer too small: "
                                 "Need %zu bytes.", command_len + 1);
-                return (-1);
+
+                goto fail;
         }
 
+        /* `cmd_len + 1' because `cmd_len' does not include the
+         * trailing null byte from ssnprintf */
+        ++command_len;
         
-        if (command_len >= ctx->send_buffer_free) {
+        if (command_len > ctx->send_buffer_free) {
                 status = wh_flush_nolock (/* timeout = */ 0, ctx);
                 if (status != 0)
                         return status;
         }
-        assert (command_len < ctx->send_buffer_free);
 
-        /* `command_len + 1' because `command_len' does not include the
-         * trailing null byte. Neither does `send_buffer_fill'. */
-        memcpy (ctx->send_buffer + ctx->send_buffer_fill,
-                        command, command_len + 1);
-        ctx->send_buffer_fill += command_len;
-        ctx->send_buffer_free -= command_len;
+        wh_fill_buffer (ctx, command, command_len);
 
         DEBUG ("write_http plugin: <%s> buffer %zu/%zu (%g%%) \"%s\"",
                 wh_cfg->location,
-                ctx->send_buffer_fill, wh_cfg->send_buffer_size,
-                100.0 * ((double) ctx->send_buffer_fill) / ((double) wh_cfg->send_buffer_size),
+                ctx->send_buffer_fill, ctx->send_buffer_size,
+                100.0 * ((double) ctx->send_buffer_fill) / ((double) ctx->send_buffer_size),
                 command);
 
-        /* Check if we have enough space for this command. */
-        return (0);
+fail:
+        status = wh_flush_nolock (/* timeout = */ 0, ctx);
+        return status;
 } /* }}} int wh_write_command */
 
 static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
@@ -493,7 +499,7 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
 
         DEBUG ("write_http plugin: <%s> buffer %zu/%zu (%g%%)",
                 wh_cfg->location,
-                ctx->send_buffer_fill, wh_cfg->send_buffer_size,
+                ctx->send_buffer_fill, ctx->send_buffer_size,
                 100.0 * ((double) ctx->send_buffer_fill) / ((double) wh_cfg->send_buffer_size));
 
         /* Check if we have enough space for this command. */
@@ -503,25 +509,15 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
 static int wh_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
                 user_data_t *unused __attribute__((unused)))
 {
-        int status;
         wh_ctx_t *ctx = wh_get_ctx();
-
         if (ctx == NULL) {
                 ERROR ("write_http plugin: cannot get ctx");
                 return (-EINVAL);
         }
 
-        if (wh_cfg == NULL) {
-                ERROR ("write_http plugin: not configured");
-                return (-EINVAL);
-        }
-
         if (wh_cfg->format == WH_FORMAT_JSON)
-                status = wh_write_json (ds, vl, ctx);
-        else
-                status = wh_write_command (ds, vl, ctx);
-
-        return (status);
+                return wh_write_json (ds, vl, ctx);
+        return wh_write_command (ds, vl, ctx);
 } /* }}} int wh_write */
 
 static int config_set_format (wh_cfg_t *cfg, /* {{{ */
@@ -530,7 +526,7 @@ static int config_set_format (wh_cfg_t *cfg, /* {{{ */
         char *string;
 
         if ((ci->values_num != 1)
-                        || (ci->values[0].type != OCONFIG_TYPE_STRING)) {
+                || (ci->values[0].type != OCONFIG_TYPE_STRING)) {
 
                 WARNING ("write_http plugin: The `%s' config option "
                                 "needs exactly one string argument.", ci->key);
@@ -673,9 +669,7 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
 #ifndef HAVE_CURLOPT_USERNAME
         if (wh_cfg->user != NULL) {
 
-                size_t credentials_size;
-
-                credentials_size = strlen (wh_cfg->user) + 2;
+                size_t credentials_size = strlen (wh_cfg->user) + 2;
                 if (wh_cfg->pass != NULL)
                         credentials_size += strlen (wh_cfg->pass);
 
@@ -695,13 +689,12 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
                 wh_cfg->low_speed_time = CDTIME_T_TO_TIME_T (plugin_get_interval());
 
         /* Determine send_buffer_size. */
-        wh_cfg->send_buffer_size = WRITE_HTTP_DEFAULT_BUFFER_SIZE;
-        if (buffer_size >= 1024)
+        wh_cfg->send_buffer_size = WH_HTTP_DEFAULT_BUFFER_SIZE;
+        if (buffer_size >= WH_HTTP_MIN_BUFFER_SIZE)
                 wh_cfg->send_buffer_size = (size_t) buffer_size;
         else if (buffer_size != 0)
                 ERROR ("write_http plugin: Ignoring invalid BufferSize setting (%d).",
                                 buffer_size);
-
 
         ssnprintf (callback_name, sizeof (callback_name), "write_http/%s",
                         wh_cfg->name);
@@ -722,7 +715,7 @@ static int wh_config (oconfig_item_t *ci) /* {{{ */
         int ret = 0;
         int i;
 
-        for (i = 0; !ret && i < ci->children_num; i++) {
+        for (i = 0; !ret && i < ci->children_num; ++i) {
 
                 oconfig_item_t *child = ci->children + i;
 
