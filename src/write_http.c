@@ -476,13 +476,14 @@ fail:
 static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
     wh_ctx_t *ctx)
 {
-        int status;
-
-        status = format_json_value_list (ctx->send_buffer,
+        int status = format_json_value_list (ctx->send_buffer,
                         &ctx->send_buffer_fill,
                         &ctx->send_buffer_free,
                         ds, vl, wh_cfg->store_rates);
-        
+
+        if (ctx->send_buffer_init_time == 0)
+                ctx->send_buffer_init_time = cdtime ();
+
         if (status == (-ENOMEM)) {
                 status = wh_flush_nolock (/* timeout = */ 0, ctx);
                 if (status != 0)
@@ -494,6 +495,7 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
                                 ds, vl, wh_cfg->store_rates);
         }
 
+        status = wh_flush_nolock (/* timeout = */ 0, ctx);
         if (status != 0)
                 return status;
 
