@@ -468,6 +468,8 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
                 100.0 * ((double) ctx->send_buffer_fill) / ((double) ctx->send_buffer_size),
                 command);
 
+        return 0;
+
 fail:
         status = wh_flush_nolock (/* timeout = */ 0, ctx);
         return status;
@@ -495,7 +497,6 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
                                 ds, vl, wh_cfg->store_rates);
         }
 
-        status = wh_flush_nolock (/* timeout = */ 0, ctx);
         if (status != 0)
                 return status;
 
@@ -504,8 +505,7 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
                 ctx->send_buffer_fill, ctx->send_buffer_size,
                 100.0 * ((double) ctx->send_buffer_fill) / ((double) wh_cfg->send_buffer_size));
 
-        /* Check if we have enough space for this command. */
-        return (0);
+        return 0;
 } /* }}} int wh_write_json */
 
 static int wh_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
