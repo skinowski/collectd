@@ -141,8 +141,8 @@ static wh_ctx_t *wh_get_ctx(void) /* {{{ */
         }
 
         if (wh_ctx_init(ctx)) {
-            ERROR ("wh_get_ctx: failed to init wh context");
-            goto fail;
+	            ERROR ("wh_get_ctx: failed to init wh context");
+	            goto fail;
         }
 
         pthread_setspecific (wh_ctx_key, ctx);
@@ -177,7 +177,8 @@ static void wh_fill_buffer (wh_ctx_t *ctx, char *cmd, size_t cmd_len) /* {{{ */
         ctx->send_buffer_free -= cmd_len;
 
         /* TODO: cdtime uses REALTIME clock, which is not really
-         * what we want here (should be CLOCK_MONOTONIC instead)
+         * what we want here since it could go backwards. We
+         * really should be using CLOCK_MONOTONIC instead.
          */
         if (ctx->send_buffer_init_time == 0)
                 ctx->send_buffer_init_time = cdtime ();
@@ -208,7 +209,7 @@ static int wh_send_buffer (wh_ctx_t *ctx) /* {{{ */
         CURL_SET_OPT(status, ctx, CURLOPT_POSTFIELDS, ctx->send_buffer);
         if (status != CURLE_OK) {
                 ERROR ("write_http plugin: curl_set_opt postfields failed with "
-                                "status %i", status);
+                        "status %i", status);
             return status;
         }
 
@@ -216,8 +217,8 @@ static int wh_send_buffer (wh_ctx_t *ctx) /* {{{ */
         wh_log_http_error (ctx);
         if (status != CURLE_OK) {
                 ERROR ("write_http plugin: curl_easy_perform failed with "
-                                "status %i: %s",
-                                status, ctx->curl_errbuf);
+                        "status %i: %s",
+                        status, ctx->curl_errbuf);
         }
 
         return status;
@@ -275,7 +276,7 @@ static int wh_ctx_init (wh_ctx_t *ctx) /* {{{ */
 
         if (wh_cfg->low_speed_limit > 0 && wh_cfg->low_speed_time > 0) {
                 CURL_SET_OPT (res, ctx, CURLOPT_LOW_SPEED_LIMIT,
-                                  (long) (wh_cfg->low_speed_limit * wh_cfg->low_speed_time));
+                          (long) (wh_cfg->low_speed_limit * wh_cfg->low_speed_time));
                 CURL_SET_OPT (res, ctx, CURLOPT_LOW_SPEED_TIME, (long) wh_cfg->low_speed_time);
         }
 
@@ -683,7 +684,7 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
                 }
 
                 ssnprintf (wh_cfg->credentials, credentials_size, "%s:%s",
-                                wh_cfg->user, (wh_cfg->pass == NULL) ? "" : wh_cfg->pass);
+                        wh_cfg->user, (wh_cfg->pass == NULL) ? "" : wh_cfg->pass);
         }
 #endif
 
@@ -696,12 +697,12 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
                 wh_cfg->send_buffer_size = (size_t) buffer_size;
         else if (buffer_size != 0)
                 ERROR ("write_http plugin: Ignoring invalid BufferSize setting (%d).",
-                                buffer_size);
+                        buffer_size);
 
         ssnprintf (callback_name, sizeof (callback_name), "write_http/%s",
-                        wh_cfg->name);
+                wh_cfg->name);
         DEBUG ("write_http: Registering write callback '%s' with URL '%s'",
-                        callback_name, wh_cfg->location);
+                callback_name, wh_cfg->location);
 
         plugin_register_flush (callback_name, wh_flush, NULL);
         plugin_register_write (callback_name, wh_write, NULL);
